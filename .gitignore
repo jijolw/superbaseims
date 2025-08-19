@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+
+# Virtual env
+venv/
+.env/
+.venv/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Jupyter/Logs
+.ipynb_checkpoints/
+*.log

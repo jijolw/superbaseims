@@ -5,6 +5,7 @@
 import os
 import io
 import json
+import urllib.parse
 from uuid import uuid4
 from datetime import datetime, timezone
 from typing import Dict, Any, List
@@ -42,6 +43,7 @@ forms_mpr = load_json("forms_mpr_configs.json")
 if not forms_lw and not forms_mpr:
     st.error("⚠️ No config files found")
     st.stop()
+
 # --------------------------
 # File helpers
 # --------------------------
@@ -74,10 +76,45 @@ def upload_files(form_code: str, files) -> tuple[List[str], List[Dict[str, Any]]
     return paths, metadata
 
 def get_file_download_url(path: str, name: str) -> str:
+    """
+    Get download URL with proper encoding for spaces and special characters
+    """
     try:
-        return sb.storage.from_(BUCKET).get_public_url(path)
-    except Exception:
-        return f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{path}?download={name}"
+        # URL encode the path to handle spaces and special characters
+        encoded_path = urllib.parse.quote(path, safe='/')
+        
+        # The Python client returns the URL as a plain string, not a dict
+        public_url = sb.storage.from_(BUCKET).get_public_url(encoded_path)
+        
+        # URL encode the filename for the download parameter
+        encoded_name = urllib.parse.quote(name)
+        
+        # Add download parameter to force download with original filename
+        if "?" in public_url:
+            final_url = f"{public_url}&download={encoded_name}"
+        else:
+            final_url = f"{public_url}?download={encoded_name}"
+            
+        return final_url
+            
+    except Exception as e:
+        # Fallback: construct URL manually with proper encoding
+        encoded_path = urllib.parse.quote(path, safe='/')
+        encoded_name = urllib.parse.quote(name)
+        fallback_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{encoded_path}?download={encoded_name}"
+        return fallback_url
+
+def delete_files_from_storage(file_paths: List[str]):
+    """
+    Delete files from Supabase storage
+    """
+    for path in file_paths:
+        try:
+            sb.storage.from_(BUCKET).remove([path])
+            print(f"Deleted file from storage: {path}")
+        except Exception as e:
+            print(f"Error deleting file {path}: {e}")
+
 # --------------------------
 # Choose Form
 # --------------------------
@@ -95,6 +132,7 @@ sigs = conf.get("signatures", [])
 tab_entry, tab_grid, tab_unsigned = st.tabs(
     ["📝 Form Entry", "📋 View & Edit", "⚠️ Unsigned Rows"]
 )
+
 with tab_entry:
     st.subheader(f"Form Entry — {conf.get('title', form_code)}")
 
@@ -131,6 +169,7 @@ with tab_entry:
         }
         sb.table("ims_entries").insert(payload).execute()
         st.success("✅ Saved successfully!")
+
 with tab_grid:
     st.caption("View, edit, delete, export, and attach files.")
 
@@ -156,12 +195,52 @@ with tab_grid:
                 row[f] = d.get(f, "")
             for s in sigs:
                 row[f"✔ {s}"] = bool(sig.get(s, False))
-            row["Files"] = ", ".join([m.get("original_name","") for m in r.get("file_metadata",[])])
+            
+            # If there are files, create a single download link for the first file
+            # (or show count if multiple files)
+            file_meta = r.get("file_metadata", [])
+            if file_meta:
+                if len(file_meta) == 1:
+                    # Single file - create direct download link
+                    url = get_file_download_url(file_meta[0]["storage_path"], file_meta[0]["original_name"])
+                    row["Files"] = url
+                else:
+                    # Multiple files - show count, links will be in canvas
+                    row["Files"] = f"{len(file_meta)} files (see canvas)"
+            else:
+                row["Files"] = ""
+            
             flat.append(row)
 
         df = pd.DataFrame(flat)
+        
+        # Configure column types for proper display
+        column_config = {}
+        if "Files" in df.columns:
+            column_config["Files"] = st.column_config.LinkColumn(
+                "Files",
+                help="Click to download file (single files only)",
+                width="medium"
+            )
+
         st.markdown("### 📊 Grid View (Excel Style)")
-        edited = st.data_editor(df, use_container_width=True, hide_index=True)
+        
+        # Display the grid with link column
+        edited = st.data_editor(
+            df, 
+            use_container_width=True, 
+            hide_index=True,
+            column_config=column_config
+        )
+        
+        # Show clickable file links separately if files column has HTML
+        st.markdown("### 📎 File Downloads")
+        for i, r in enumerate(rows):
+            if r.get("file_metadata"):
+                st.markdown(f"**Row {i+1} Files:**")
+                for m in r["file_metadata"]:
+                    url = get_file_download_url(m["storage_path"], m["original_name"])
+                    st.markdown(f"- [{m['original_name']}]({url}) ({m['file_size']} bytes)")
 
         if st.button("💾 Save edits", type="primary"):
             for _, er in edited.iterrows():
@@ -175,33 +254,69 @@ with tab_grid:
             st.success("Changes saved.")
             st.rerun()
 
-        # Export CSV
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download CSV", csv,
-                           file_name=f"{form_code}.csv", mime="text/csv")
+        # Action buttons in columns for better layout
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            # Export CSV
+            csv = df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download CSV", 
+                csv,
+                file_name=f"{form_code}.csv", 
+                mime="text/csv",
+                type="secondary"
+            )
+        
+        with col2:
+            # Delete rows
+            del_ids = st.multiselect("Delete rows", options=[r["id"] for r in rows])
+            
+        with col3:
+            if del_ids:
+                if st.button("🗑️ Delete selected", type="secondary"):
+                    # First get the file paths from rows to be deleted
+                    rows_to_delete = [r for r in rows if r["id"] in del_ids]
+                    all_file_paths = []
+                    for row in rows_to_delete:
+                        file_urls = row.get("file_urls", [])
+                        all_file_paths.extend(file_urls)
+                    
+                    # Delete files from storage
+                    if all_file_paths:
+                        delete_files_from_storage(all_file_paths)
+                    
+                    # Delete rows from database
+                    sb.table("ims_entries").delete().in_("id", del_ids).execute()
+                    st.success(f"Deleted {len(del_ids)} rows and {len(all_file_paths)} files from storage.")
+                    st.rerun()
 
-        # Delete rows
-        del_ids = st.multiselect("Delete rows", options=[r["id"] for r in rows])
-        if st.button("🗑️ Delete selected", type="secondary"):
-            sb.table("ims_entries").delete().in_("id", del_ids).execute()
-            st.success("Deleted selected rows.")
-            st.rerun()
-
-        # Attach files
-        chosen_id = st.selectbox("Row to attach files", [r["id"] for r in rows])
-        new_files = st.file_uploader("Attach new files", type=None, accept_multiple_files=True, key="attach")
-        if st.button("Upload & attach"):
-            paths, meta = upload_files(form_code, new_files)
-            if paths:
-                row = sb.table("ims_entries").select("file_urls,file_metadata").eq("id", chosen_id).single().execute().data
-                existing_urls = row.get("file_urls") or []
-                existing_meta = row.get("file_metadata") or []
-                sb.table("ims_entries").update({
-                    "file_urls": existing_urls + paths,
-                    "file_metadata": existing_meta + meta
-                }).eq("id", chosen_id).execute()
-                st.success("Files attached.")
-                st.rerun()
+        # Attach files section
+        st.markdown("---")
+        st.markdown("### 📎 Attach Files to Existing Rows")
+        
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            chosen_id = st.selectbox("Select row to attach files", [r["id"] for r in rows])
+            new_files = st.file_uploader("Attach new files", type=None, accept_multiple_files=True, key="attach")
+        
+        with col2:
+            st.markdown("<br>", unsafe_allow_html=True)  # Add spacing
+            if st.button("📎 Upload & Attach", type="secondary"):
+                if new_files:
+                    paths, meta = upload_files(form_code, new_files)
+                    if paths:
+                        row = sb.table("ims_entries").select("file_urls,file_metadata").eq("id", chosen_id).single().execute().data
+                        existing_urls = row.get("file_urls") or []
+                        existing_meta = row.get("file_metadata") or []
+                        sb.table("ims_entries").update({
+                            "file_urls": existing_urls + paths,
+                            "file_metadata": existing_meta + meta
+                        }).eq("id", chosen_id).execute()
+                        st.success("Files attached successfully!")
+                        st.rerun()
+                else:
+                    st.warning("Please select files to upload.")
 
         # -------------------------
         # Canvas View (Readable Form Layout)
@@ -225,6 +340,7 @@ with tab_grid:
                     for m in r["file_metadata"]:
                         url = get_file_download_url(m["storage_path"], m["original_name"])
                         st.markdown(f"- [{m['original_name']}]({url}) ({m['file_size']} bytes)")
+
 with tab_unsigned:
     st.caption("Pending signatures grouped by form")
 
@@ -264,7 +380,6 @@ with tab_unsigned:
                 # Show entry data in full width table
                 df_view = pd.DataFrame(e["data"].items(), columns=["Field", "Value"])
                 st.table(df_view)
-
 
 # --------------------------
 # Footer
